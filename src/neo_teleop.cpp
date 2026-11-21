@@ -34,6 +34,7 @@
 
 #include <sensor_msgs/msg/joy.hpp>
 #include <geometry_msgs/msg/twist.hpp>
+#include <cmath>
 #include <memory>
 #include "rclcpp/rclcpp.hpp"
 
@@ -56,6 +57,17 @@ public:
     this->declare_parameter<double>("smooth_factor", 0.2);
     this->declare_parameter<int>("deadman_button", 5);
     this->declare_parameter<double>("joy_timeout", 1.);
+    // Logitech F710: the X/D switch on its back changes the axis layout. D (DirectInput): 6 axes,
+    // the right stick X is axis 2. X (XInput): 8 axes, axis 2 is the LEFT TRIGGER (rests at +-1 ->
+    // full-speed rotation), the right stick X is axis 3. Used when /joy has xinput_num_axes axes.
+    this->declare_parameter<int>("axis_angular_z_xinput", 3);
+    this->declare_parameter<int>("xinput_num_axes", 8);
+    // stop if /joy goes silent while the deadman is held (joy_node repeats at 20 Hz; a wireless
+    // dropout or a re-enumerating receiver must not keep the last command going) [s]
+    this->declare_parameter<double>("joy_stale_timeout", 0.3);
+    // the sticks must be within this of centre when the deadman is pressed, else nothing moves
+    // until they are (a pad waking up can report full-scale axes for a moment)
+    this->declare_parameter<double>("engage_max_axis", 0.2);
 
     // Get Paramters
     this->get_parameter("scale_linear_x", linear_scale_x);
@@ -67,6 +79,10 @@ public:
     this->get_parameter("smooth_factor", smooth_factor);
     this->get_parameter("deadman_button", deadman_button);
     this->get_parameter("joy_timeout", joy_timeout);
+    this->get_parameter("axis_angular_z_xinput", axis_angular_z_xinput);
+    this->get_parameter("xinput_num_axes", xinput_num_axes);
+    this->get_parameter("joy_stale_timeout", joy_stale_timeout);
+    this->get_parameter("engage_max_axis", engage_max_axis);
 
     vel_pub = this->create_publisher<geometry_msgs::msg::Twist>("cmd_vel", 1);
     joy_sub = this->create_subscription<sensor_msgs::msg::Joy>(
@@ -93,8 +109,17 @@ private:
   int axis_linear_y = -1;
   int axis_angular_z = -1;
   int deadman_button = -1;
+  int axis_angular_z_xinput = -1;
+  int xinput_num_axes = -1;
+  double joy_stale_timeout = 0;
+  double engage_max_axis = 1;
 
   rclcpp::Time last_joy_time;
+  rclcpp::Time last_msg_time;
+  bool have_msg = false;
+  bool is_engaged = false;  // deadman pressed with the sticks centred; false until they are
+  int last_num_axes = -1;
+
   double joy_command_x = 0;
   double joy_command_y = 0;
   double joy_command_z = 0;
@@ -104,32 +129,73 @@ private:
 };
 
 
+static double axis(const sensor_msgs::msg::Joy & joy, int i)
+{
+  return (i >= 0 && i < static_cast<int>(joy.axes.size())) ? joy.axes[i] : 0.0;
+}
+
 void NeoTeleop::joy_callback(const sensor_msgs::msg::Joy::SharedPtr joy)
 {
+  const int num_axes = static_cast<int>(joy->axes.size());
+  const bool xinput = num_axes == xinput_num_axes;
+  if (num_axes != last_num_axes) {
+    RCLCPP_WARN(get_logger(), "joystick has %d axes: %s mode, angular z on axis %d", num_axes,
+      xinput ? "XInput (F710 switch X)" : "DirectInput (F710 switch D)",
+      xinput ? axis_angular_z_xinput : axis_angular_z);
+    last_num_axes = num_axes;
+    is_engaged = false;  // layout changed under a held deadman: re-engage with centred sticks
+  }
+  last_msg_time = rclcpp::Clock().now();
+  have_msg = true;
+
+  const bool was_pressed = is_deadman_pressed;
   if (deadman_button >= 0 && deadman_button < static_cast<int>(joy->buttons.size())) {
     is_deadman_pressed = static_cast<bool>(joy->buttons[deadman_button]);
   } else {
     is_deadman_pressed = false;
   }
-  if (is_deadman_pressed) {
+
+  const double x = axis(*joy, axis_linear_x);
+  const double y = axis(*joy, axis_linear_y);
+  const double z = axis(*joy, xinput ? axis_angular_z_xinput : axis_angular_z);
+
+  if (!is_deadman_pressed) {
+    is_engaged = false;
+  } else if (!is_engaged) {
+    if (std::abs(x) <= engage_max_axis && std::abs(y) <= engage_max_axis &&
+      std::abs(z) <= engage_max_axis)
+    {
+      is_engaged = true;
+    } else if (!was_pressed) {
+      RCLCPP_WARN(get_logger(), "deadman pressed with the sticks off centre (%.2f %.2f %.2f): "
+        "not moving until they are centred", x, y, z);
+    }
+  }
+  if (is_engaged) {
     is_active = true;
-    last_joy_time = rclcpp::Clock().now();
+    last_joy_time = last_msg_time;
   }
 
-  if (axis_linear_x >= 0 && axis_linear_x < static_cast<int>(joy->axes.size())) {
-    joy_command_x = linear_scale_x * joy->axes[axis_linear_x];
-  }
-  if (axis_linear_y >= 0 && axis_linear_y < static_cast<int>(joy->axes.size())) {
-    joy_command_y = linear_scale_y * joy->axes[axis_linear_y];
-  }
-  if (axis_angular_z >= 0 && axis_angular_z < static_cast<int>(joy->axes.size())) {
-    joy_command_z = angular_scale_z * joy->axes[axis_angular_z];
-  }
+  joy_command_x = is_engaged ? linear_scale_x * x : 0.0;
+  joy_command_y = is_engaged ? linear_scale_y * y : 0.0;
+  joy_command_z = is_engaged ? angular_scale_z * z : 0.0;
 }
 
 void NeoTeleop::send_cmd()
 {
-  if (is_deadman_pressed) {
+  if (is_engaged && have_msg &&
+    (rclcpp::Clock().now() - last_msg_time).seconds() > joy_stale_timeout)
+  {
+    RCLCPP_ERROR(get_logger(), "no /joy for %.1f s with the deadman held (wireless dropout?): "
+      "stopping", (rclcpp::Clock().now() - last_msg_time).seconds());
+    is_deadman_pressed = false;
+    is_engaged = false;
+    is_active = false;
+    cmd_vel = geometry_msgs::msg::Twist();
+    vel_pub->publish(cmd_vel);
+    return;
+  }
+  if (is_engaged) {
     // smooth inputs
     cmd_vel.linear.x = joy_command_x * smooth_factor + cmd_vel.linear.x * (1 - smooth_factor);
     cmd_vel.linear.y = joy_command_y * smooth_factor + cmd_vel.linear.y * (1 - smooth_factor);
